@@ -48,27 +48,19 @@ func formatFilesystem(dev, label, filesystem string) error {
 	return nil
 }
 
-func findDeviceWithTimeout(volId string) (string, error) {
-	devicePaths := []string{
-		"/dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_%s",
-		"/dev/disk/by-id/virtio-%.20s",
-	}
 
-	for i := 1; i <= 10; i++ {
-		time.Sleep(500 * time.Millisecond)
-		for _, devicePath := range devicePaths {
-			dev := fmt.Sprintf(devicePath, volId)
-			if _, err := os.Stat(dev); err != nil {
-				if !os.IsNotExist(err) {
-					return "", err
-				}
-			} else {
-				return dev, nil
-			}
-		}
-	}
-
-	return "", fmt.Errorf("Block device not found")
+func findDeviceWithTimeout() (string, error) {
+    for i := 0; i < 20; i++ {
+        time.Sleep(500 * time.Millisecond)
+        devices, _ := filepath.Glob("/dev/vd*")
+        fmt.Println("Current devices:", devices)
+        for _, d := range devices {
+            if d != "/dev/vda" {
+                return d, nil
+            }
+        }
+    }
+    return "", fmt.Errorf("Block device not found")
 }
 
 func isDirectoryPresent(path string) (bool, error) {
