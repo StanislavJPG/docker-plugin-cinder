@@ -449,25 +449,55 @@ func (d plugin) detachVolume(ctx context.Context, vol *volumes.Volume) (*volumes
 	return vol, nil
 }
 
-func (d plugin) waitOnVolumeState(ctx context.Context, vol *volumes.Volume, status string) (*volumes.Volume, error) {
-	if vol.Status == status {
-		return vol, nil
-	}
+func (d plugin) waitOnVolumeState(
+    ctx context.Context,
+    vol *volumes.Volume,
+    status string,
+) (*volumes.Volume, error) {
 
-	for i := 1; i <= 10; i++ {
-		time.Sleep(500 * time.Millisecond)
+    if vol.Status == status {
+        return vol, nil
+    }
 
-		vol, err := volumes.Get(ctx, d.blockClient, vol.ID).Extract()
-		if err != nil {
-			return nil, err
-		}
+    timeout := time.After(60 * time.Second)
+    ticker := time.NewTicker(1 * time.Second)
+    defer ticker.Stop()
 
-		if vol.Status == status {
-			return vol, nil
-		}
-	}
+    for {
+        select {
+        case <-ctx.Done():
+            return nil, ctx.Err()
 
-	log.Debugf("Volume status did not change to %s: %+v", status, vol)
+        case <-timeout:
+            return vol, fmt.Errorf(
+                "volume %s did not reach status %s (last=%s)",
+                vol.ID, status, vol.Status,
+            )
 
-	return nil, fmt.Errorf("Volume status changed to %s", status)
+        case <-ticker.C:
+            updated, err := volumes.Get(ctx, d.blockClient, vol.ID).Extract()
+            if err != nil {
+                return nil, err
+            }
+
+            vol = updated
+
+            log.Debugf(
+                "Waiting for volume %s: current=%s, desired=%s",
+                vol.ID, vol.Status, status,
+            )
+
+            if vol.Status == status {
+                return vol, nil
+            }
+
+            if status == "in-use" && vol.Status == "available" {
+                log.Warnf(
+                    "Volume %s is still available while waiting for in-use, continuing",
+                    vol.ID,
+                )
+            }
+        }
+    }
 }
+
