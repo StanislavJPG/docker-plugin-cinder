@@ -6,11 +6,8 @@ import (
 	"os"
 	"os/exec"
 	"slices"
-	"time",
-	"fmt"
-	"os"
-	"path/filepath"
 	"time"
+	"path/filepath"
 )
 
 var filesystems []string = []string{
