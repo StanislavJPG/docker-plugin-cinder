@@ -10,7 +10,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	uuid "github.com/satori/go.uuid"
@@ -145,11 +144,38 @@ func (d plugin) Mount(r *volume.MountRequest) (*volume.MountResponse, error) {
         return nil, fmt.Errorf("Volume not found: %v", err)
     }
 
+    mountPath := filepath.Join(d.config.MountDir, r.Name)
+
+    // CHECK 1: Is it already mounted on this host?
+    mounted, err := isMounted(mountPath)
+    if err != nil {
+        logger.Warnf("Failed to check mount status: %v", err)
+    }
+    if mounted {
+        logger.Infof("Volume '%s' is already mounted at %s", r.Name, mountPath)
+        return &volume.MountResponse{Mountpoint: mountPath}, nil
+    }
+
     existing, _ := filepath.Glob("/dev/vd*")
     logger.Infof("Devices before attach: %v", existing)
 
-    // Attach only if not attached
-    if len(vol.Attachments) == 0 {
+    // CHECK 2: Is it attached to THIS instance?
+    var attachedToThisInstance bool
+    var devicePath string
+
+    if len(vol.Attachments) > 0 {
+        for _, attachment := range vol.Attachments {
+            if attachment.ServerID == d.config.MachineID {
+                attachedToThisInstance = true
+                devicePath = attachment.Device
+                logger.Infof("Volume %s already attached to this instance as %s", vol.ID, devicePath)
+                break
+            }
+        }
+    }
+
+    // Attach only if not attached to this instance
+    if !attachedToThisInstance {
         logger.Infof("Attaching volume %s to instance %s", vol.ID, d.config.MachineID)
         opts := volumeattach.CreateOpts{VolumeID: vol.ID}
         _, err := volumeattach.Create(context.TODO(), d.computeClient, d.config.MachineID, opts).Extract()
@@ -163,47 +189,73 @@ func (d plugin) Mount(r *volume.MountRequest) (*volume.MountResponse, error) {
             return nil, fmt.Errorf("Timeout waiting for volume to attach: %v", err)
         }
         logger.Infof("Volume %s is now in-use", vol.ID)
+
+        // Find the new device
+        logger.Infof("Searching for new block device...")
+        devicePath, err = findDeviceWithTimeout(existing)
+        if err != nil {
+            current, _ := filepath.Glob("/dev/vd*")
+            logger.Errorf("Failed to find device. Before: %v, After: %v", existing, current)
+            return nil, fmt.Errorf("Block device not found for volume %s", vol.ID)
+        }
     } else {
-        logger.Infof("Volume %s already attached", vol.ID)
+        // Device should already exist, verify it
+        if devicePath == "" {
+            // Try to find it
+            devicePath, err = findDeviceWithTimeout(existing)
+            if err != nil {
+                return nil, fmt.Errorf("Block device not found for attached volume %s", vol.ID)
+            }
+        }
     }
 
-    logger.Infof("Searching for new block device...")
-    dev, err := findDeviceWithTimeout(existing)
-    if err != nil {
-        current, _ := filepath.Glob("/dev/vd*")
-        logger.Errorf("Failed to find device. Before: %v, After: %v", existing, current)
-        return nil, fmt.Errorf("Block device not found for volume %s", vol.ID)
-    }
+    logger.Infof("Using device: %s", devicePath)
 
-    logger.Infof("Found device: %s", dev)
-
-    fsType, err := getFilesystemType(dev)
+    fsType, err := getFilesystemType(devicePath)
     if err != nil {
         return nil, fmt.Errorf("Detecting filesystem failed: %v", err)
     }
 
     if fsType == "" {
-        logger.Infof("Formatting device %s as ext4", dev)
-        if err := formatFilesystem(dev, r.Name, "ext4"); err != nil {
+        logger.Infof("Formatting device %s as ext4", devicePath)
+        if err := formatFilesystem(devicePath, r.Name, "ext4"); err != nil {
             return nil, fmt.Errorf("Formatting failed: %v", err)
         }
     } else {
-        logger.Infof("Device %s already has filesystem: %s", dev, fsType)
+        logger.Infof("Device %s already has filesystem: %s", devicePath, fsType)
     }
 
-    mountPath := filepath.Join(d.config.MountDir, r.Name)
     if err = os.MkdirAll(mountPath, 0700); err != nil {
-        return nil, fmt.Errorf("Cannot create mount path: %v", err)
-    }
+    	return nil, fmt.Errorf("Cannot create mount path: %v", err)
+	}
 
-    logger.Infof("Mounting %s to %s", dev, mountPath)
-    out, err := exec.Command("mount", dev, mountPath).CombinedOutput()
+	logger.Infof("Mounting %s to %s", devicePath, mountPath)
+	if out, err := exec.Command("mount", devicePath, mountPath).CombinedOutput(); err != nil {
+		// Check if it's "already mounted" error
+		if strings.Contains(string(out), "already mounted") {
+			logger.Infof("Device already mounted, continuing...")
+			return &volume.MountResponse{Mountpoint: mountPath}, nil
+		}
+		return nil, fmt.Errorf("Mount failed: %s", out)
+	}
+
+	logger.Infof("Volume '%s' mounted successfully at %s", r.Name, mountPath)
+	return &volume.MountResponse{Mountpoint: mountPath}, nil
+}
+
+// Helper function to check if path is mounted
+func isMounted(path string) (bool, error) {
+    err := exec.Command("mountpoint", "-q", path).Run()
     if err != nil {
-        return nil, fmt.Errorf("Mount failed: %s", out)
+        if exitErr, ok := err.(*exec.ExitError); ok {
+            // Exit code 1 means not mounted
+            if exitErr.ExitCode() == 1 {
+                return false, nil
+            }
+        }
+        return false, err
     }
-
-    logger.Infof("Volume '%s' mounted successfully at %s", r.Name, mountPath)
-    return &volume.MountResponse{Mountpoint: mountPath}, nil
+    return true, nil
 }
 
 func findNewDevice(existing []string) (string, error) {
@@ -244,30 +296,28 @@ func (d plugin) Remove(r *volume.RemoveRequest) error {
 }
 
 func (d plugin) Unmount(r *volume.UnmountRequest) error {
-	ctx := context.TODO()
-	d.mutex.Lock()
-	defer d.mutex.Unlock()
+    logger := log.WithFields(log.Fields{"name": r.Name, "action": "unmount"})
+    logger.Infof("Unmounting volume '%s'", r.Name)
 
-	mountPath := filepath.Join(d.config.MountDir, r.Name)
-	if _, err := os.Stat(mountPath); err == nil {
-		_ = syscall.Unmount(mountPath, 0)
-	}
+    mountPath := filepath.Join(d.config.MountDir, r.Name)
 
-	vol, err := d.getByName(r.Name)
-	if err != nil {
-		return err
-	}
+    // Check if actually mounted
+    mounted, err := isMounted(mountPath)
+    if err != nil {
+        logger.Warnf("Failed to check mount status: %v", err)
+    }
+    if !mounted {
+        logger.Infof("Volume '%s' is not mounted, skipping unmount", r.Name)
+        return nil
+    }
 
-	if len(vol.Attachments) > 0 {
-		if _, err := d.detachVolume(ctx, vol); err != nil {
-			return err
-		}
-		if _, err := d.waitOnVolumeState(ctx, vol, "available"); err != nil {
-			return err
-		}
-	}
+    logger.Infof("Unmounting %s", mountPath)
+    if out, err := exec.Command("umount", mountPath).CombinedOutput(); err != nil {
+        return fmt.Errorf("Unmount failed: %s", out)
+    }
 
-	return nil
+    logger.Infof("Volume '%s' unmounted successfully", r.Name)
+    return nil
 }
 
 func (d plugin) getByName(name string) (*volumes.Volume, error) {
