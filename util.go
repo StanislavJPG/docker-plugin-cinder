@@ -156,8 +156,25 @@ func deviceExists(devicePath string) bool {
     return err == nil
 }
 
+// isDeviceMounted checks if a device is currently mounted anywhere
+func isDeviceMounted(devicePath string) (bool, string, error) {
+    out, err := exec.Command("findmnt", "-n", "-o", "TARGET", "-S", devicePath).CombinedOutput()
+    if err != nil {
+        // findmnt returns non-zero if device is not mounted
+        return false, "", nil
+    }
+
+    mountpoint := strings.TrimSpace(string(out))
+    if mountpoint != "" {
+        return true, mountpoint, nil
+    }
+
+    return false, "", nil
+}
+
 // findDeviceByVolumeID finds a device by matching the volume ID with device serial
 // OpenStack volumes expose their ID as the device serial number
+// FIXED: Now checks if device is already mounted and skips it
 func findDeviceByVolumeID(volumeID string) (string, error) {
     log.Infof("Searching for device with volume ID: %s", volumeID)
 
@@ -166,9 +183,17 @@ func findDeviceByVolumeID(volumeID string) (string, error) {
         return "", fmt.Errorf("failed to list devices: %v", err)
     }
 
+    // First pass: look for exact match that's not mounted
     for _, dev := range devices {
         // Skip partition devices
         if strings.ContainsAny(dev[len(dev)-1:], "0123456789") {
+            continue
+        }
+
+        // Check if device is already mounted
+        mounted, mountpoint, _ := isDeviceMounted(dev)
+        if mounted {
+            log.Debugf("Device %s is already mounted at %s, skipping", dev, mountpoint)
             continue
         }
 
@@ -176,16 +201,43 @@ func findDeviceByVolumeID(volumeID string) (string, error) {
         serial := getDeviceSerial(dev)
         log.Debugf("Device %s has serial: %s", dev, serial)
 
-        // Match serial with volume ID (OpenStack may truncate to 20 chars)
-        if serial != "" && (strings.HasPrefix(volumeID, serial) || strings.HasPrefix(serial, volumeID)) {
-            log.Infof("Found matching device %s for volume %s", dev, volumeID)
-            return dev, nil
+        // Match serial with volume ID
+        // OpenStack truncates UUID to 20 chars for serial, so we check prefix match
+        if serial != "" && len(serial) >= 20 {
+            volumePrefix := volumeID
+            if len(volumePrefix) > 20 {
+                volumePrefix = volumePrefix[:20]
+            }
+
+            if strings.HasPrefix(volumeID, serial) || serial == volumePrefix {
+                log.Infof("Found matching device %s for volume %s (serial: %s)", dev, volumeID, serial)
+                return dev, nil
+            }
+        }
+    }
+
+    // Second pass: if no unmounted device found, try to find any match
+    // (this shouldn't normally happen, but helps with debugging)
+    for _, dev := range devices {
+        if strings.ContainsAny(dev[len(dev)-1:], "0123456789") {
+            continue
         }
 
-        // Also try exact match
-        if serial == volumeID {
-            log.Infof("Found matching device %s for volume %s", dev, volumeID)
-            return dev, nil
+        serial := getDeviceSerial(dev)
+        if serial != "" && len(serial) >= 20 {
+            volumePrefix := volumeID
+            if len(volumePrefix) > 20 {
+                volumePrefix = volumePrefix[:20]
+            }
+
+            if strings.HasPrefix(volumeID, serial) || serial == volumePrefix {
+                mounted, mountpoint, _ := isDeviceMounted(dev)
+                if mounted {
+                    log.Warnf("Found device %s for volume %s but it's already mounted at %s",
+                        dev, volumeID, mountpoint)
+                }
+                return dev, nil
+            }
         }
     }
 

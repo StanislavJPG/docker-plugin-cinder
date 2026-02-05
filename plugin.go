@@ -327,32 +327,35 @@ func (d plugin) Mount(r *volume.MountRequest) (*volume.MountResponse, error) {
         // Volume already attached - need to find which device it is
         logger.Infof("Volume already attached to this instance")
 
-        // First try: use device path from OpenStack attachment
-        if devicePath != "" {
-            logger.Infof("Device path from OpenStack attachment: %s", devicePath)
-            if !deviceExists(devicePath) {
-                logger.Warnf("Device %s from OpenStack doesn't exist, will search by volume ID", devicePath)
-                devicePath = ""
-            }
-        }
+        // ALWAYS search by volume ID (don't trust OpenStack device path)
+        // OpenStack may report /dev/vdb but kernel creates /dev/vde
+        logger.Infof("Searching for device by volume ID (ignoring OpenStack device path)...")
+        devicePath, err = findDeviceByVolumeID(vol.ID)
+        if err != nil {
+            logger.Errorf("Failed to find device by volume ID: %v", err)
 
-        // Second try: find device by volume ID serial number
-        if devicePath == "" {
-            logger.Infof("Searching for device by volume ID...")
+            // Wait a bit and retry (device might not be ready yet)
+            logger.Infof("Waiting for device to appear...")
+            time.Sleep(2 * time.Second)
             devicePath, err = findDeviceByVolumeID(vol.ID)
             if err != nil {
-                logger.Errorf("Failed to find device by volume ID: %v", err)
-
-                // Third try: if we can't find it, it might be a race condition
-                // Wait a bit and try to find any new device
-                logger.Infof("Waiting for device to appear...")
-                time.Sleep(2 * time.Second)
-                devicePath, err = findDeviceByVolumeID(vol.ID)
-                if err != nil {
-                    return nil, fmt.Errorf("cannot find device for attached volume %s: %v", vol.ID, err)
-                }
+                return nil, fmt.Errorf("cannot find device for attached volume %s: %v", vol.ID, err)
             }
-            logger.Infof("Found device by volume ID: %s", devicePath)
+        }
+        logger.Infof("Found device by volume ID: %s", devicePath)
+
+        // Double-check that device is not already mounted elsewhere
+        mounted, mountpoint, _ := isDeviceMounted(devicePath)
+        if mounted {
+            logger.Warnf("Device %s is already mounted at %s!", devicePath, mountpoint)
+            // If it's mounted to the correct path, just return success
+            if mountpoint == mountPath {
+                logger.Infof("Device is already mounted at correct location")
+                return &volume.MountResponse{Mountpoint: mountPath}, nil
+            }
+            // If mounted elsewhere, this is an error
+            return nil, fmt.Errorf("device %s is already mounted at %s (expected %s)",
+                devicePath, mountpoint, mountPath)
         }
     }
 
