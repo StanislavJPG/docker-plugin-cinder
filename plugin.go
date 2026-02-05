@@ -31,15 +31,50 @@ type plugin struct {
 }
 
 func newPlugin(provider *gophercloud.ProviderClient, endpointOpts gophercloud.EndpointOpts, config *tConfig) (*plugin, error) {
+	log.Infof("Discovering OpenStack endpoints...")
+	log.Infof("EndpointOpts: Region=%s, Availability=%s", endpointOpts.Region, endpointOpts.Availability)
+
+	// Try to create block storage client
 	blockClient, err := openstack.NewBlockStorageV3(provider, endpointOpts)
 	if err != nil {
-		return nil, err
+		log.Errorf("Failed to discover block storage endpoint using standard method: %v", err)
+		identityEndpoint := provider.IdentityEndpoint
+
+		parts := strings.SplitN(identityEndpoint, "://", 2)
+		if len(parts) != 2 {
+			return nil, fmt.Errorf("invalid identity endpoint format: %s", identityEndpoint)
+		}
+		scheme := parts[0]
+		hostAndPath := parts[1]
+
+		hostParts := strings.SplitN(hostAndPath, "/", 2)
+		host := hostParts[0]
+
+		cinderURL := fmt.Sprintf("%s://%s/volume/v3", scheme, host)
+
+		log.Infof("Attempting manual endpoint construction: %s", cinderURL)
+
+		blockClient = &gophercloud.ServiceClient{
+			ProviderClient: provider,
+			Endpoint:       cinderURL,
+			Type:           "block-storage",
+		}
+
+		// ResourceBase should have the trailing slash for proper path construction
+		blockClient.ResourceBase = cinderURL + "/"
+
+		log.Infof("Manually constructed block storage client - Endpoint: %s, ResourceBase: %s",
+			blockClient.Endpoint, blockClient.ResourceBase)
+	} else {
+		log.Infof("Block storage endpoint discovered: %s", blockClient.Endpoint)
 	}
 
 	computeClient, err := openstack.NewComputeV2(provider, endpointOpts)
 	if err != nil {
-		return nil, err
+		log.Errorf("Failed to discover compute endpoint: %v", err)
+		return nil, fmt.Errorf("failed to create compute client: %v", err)
 	}
+	log.Infof("Compute endpoint discovered: %s", computeClient.Endpoint)
 
 	if config.MachineID == "" {
 		// Try to get instance UUID from OpenStack metadata first (most reliable)
