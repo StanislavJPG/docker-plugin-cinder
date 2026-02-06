@@ -2,8 +2,11 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -274,13 +277,57 @@ func (d plugin) Mount(r *volume.MountRequest) (*volume.MountResponse, error) {
                 logger.Warnf("✗ Volume %s is attached to DIFFERENT server: %s (our ID: %s)",
                     vol.ID, attachment.ServerID, d.config.MachineID)
 
+                // Check instance state before attempting detach
+                // If instance is rebooting, wait for it to complete
+                logger.Infof("→ Checking server %s state before detach...", attachment.ServerID)
+                serverState, err := d.getServerState(context.TODO(), attachment.ServerID)
+                if err != nil {
+                    logger.Warnf("Could not get server state: %v, attempting detach anyway", err)
+                } else {
+                    logger.Infof("Server state: %s, task_state: %s", serverState.Status, serverState.TaskState)
+
+                    // If server is rebooting, wait for it to complete
+                    if serverState.TaskState == "reboot_started" || serverState.TaskState == "rebooting" {
+                        logger.Infof("→ Server is rebooting, waiting up to 60s for completion...")
+                        for i := 0; i < 60; i++ {
+                            time.Sleep(1 * time.Second)
+                            serverState, err = d.getServerState(context.TODO(), attachment.ServerID)
+                            if err != nil {
+                                break
+                            }
+                            if serverState.TaskState == "" || serverState.TaskState == "none" {
+                                logger.Infof("✓ Server reboot completed (state: %s)", serverState.Status)
+                                break
+                            }
+                            if i%10 == 0 {
+                                logger.Infof("Still waiting... (task_state: %s)", serverState.TaskState)
+                            }
+                        }
+
+                        // Check if reboot completed
+                        if serverState.TaskState == "reboot_started" || serverState.TaskState == "rebooting" {
+                            logger.Warnf("Server still rebooting after 60s, will try detach anyway")
+                        }
+                    }
+                }
+
                 // Force detach from other instance
-                // This handles both: VM reboot with new machine-id AND Swarm rescheduling
                 logger.Infof("→ Attempting force detach from server %s", attachment.ServerID)
                 ctx := context.TODO()
                 if err := volumeattach.Delete(ctx, d.computeClient, attachment.ServerID, attachment.ID).ExtractErr(); err != nil {
                     logger.Errorf("✗ Detach failed: %v", err)
-                    return nil, fmt.Errorf("failed to detach volume from server %s: %v", attachment.ServerID, err)
+
+                    // If detach failed due to instance state, wait and retry
+                    if strings.Contains(err.Error(), "task_state") {
+                        logger.Infof("→ Detach failed due to instance state, waiting 10s and retrying...")
+                        time.Sleep(10 * time.Second)
+                        if err := volumeattach.Delete(ctx, d.computeClient, attachment.ServerID, attachment.ID).ExtractErr(); err != nil {
+                            return nil, fmt.Errorf("failed to detach volume from server %s after retry: %v", attachment.ServerID, err)
+                        }
+                        logger.Infof("✓ Detach succeeded on retry")
+                    } else {
+                        return nil, fmt.Errorf("failed to detach volume from server %s: %v", attachment.ServerID, err)
+                    }
                 }
                 logger.Infof("✓ Detached successfully")
 
@@ -630,4 +677,52 @@ func (d plugin) waitOnVolumeState(ctx context.Context, vol *volumes.Volume, stat
             }
         }
     }
+}
+
+// ServerState represents the state of a compute instance
+type ServerState struct {
+    Status    string
+    TaskState string
+}
+
+// getServerState retrieves the current state of a compute instance
+func (d plugin) getServerState(ctx context.Context, serverID string) (*ServerState, error) {
+    type serverResponse struct {
+        Server struct {
+            Status    string `json:"status"`
+            TaskState string `json:"OS-EXT-STS:task_state"`
+        } `json:"server"`
+    }
+
+    url := fmt.Sprintf("%s/servers/%s", d.computeClient.ResourceBase, serverID)
+
+    req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+    if err != nil {
+        return nil, err
+    }
+
+    req.Header.Set("X-Auth-Token", d.computeClient.Token())
+    req.Header.Set("Accept", "application/json")
+
+    client := &http.Client{Timeout: 5 * time.Second}
+    resp, err := client.Do(req)
+    if err != nil {
+        return nil, err
+    }
+    defer resp.Body.Close()
+
+    if resp.StatusCode != 200 {
+        body, _ := io.ReadAll(resp.Body)
+        return nil, fmt.Errorf("unexpected status %d: %s", resp.StatusCode, string(body))
+    }
+
+    var data serverResponse
+    if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+        return nil, err
+    }
+
+    return &ServerState{
+        Status:    data.Server.Status,
+        TaskState: data.Server.TaskState,
+    }, nil
 }
