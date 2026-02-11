@@ -2,8 +2,11 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -31,27 +34,91 @@ type plugin struct {
 }
 
 func newPlugin(provider *gophercloud.ProviderClient, endpointOpts gophercloud.EndpointOpts, config *tConfig) (*plugin, error) {
+	log.Infof("Discovering OpenStack endpoints...")
+	log.Infof("EndpointOpts: Region=%s, Availability=%s", endpointOpts.Region, endpointOpts.Availability)
+
+	// Try to create block storage client
 	blockClient, err := openstack.NewBlockStorageV3(provider, endpointOpts)
 	if err != nil {
-		return nil, err
+		log.Errorf("Failed to discover block storage endpoint using standard method: %v", err)
+		identityEndpoint := provider.IdentityEndpoint
+
+		parts := strings.SplitN(identityEndpoint, "://", 2)
+		if len(parts) != 2 {
+			return nil, fmt.Errorf("invalid identity endpoint format: %s", identityEndpoint)
+		}
+		scheme := parts[0]
+		hostAndPath := parts[1]
+
+		hostParts := strings.SplitN(hostAndPath, "/", 2)
+		host := hostParts[0]
+
+		cinderURL := fmt.Sprintf("%s://%s/volume/v3", scheme, host)
+
+		log.Infof("Attempting manual endpoint construction: %s", cinderURL)
+
+		blockClient = &gophercloud.ServiceClient{
+			ProviderClient: provider,
+			Endpoint:       cinderURL,
+			Type:           "block-storage",
+		}
+
+		// ResourceBase should have the trailing slash for proper path construction
+		blockClient.ResourceBase = cinderURL + "/"
+
+		log.Infof("Manually constructed block storage client - Endpoint: %s, ResourceBase: %s",
+			blockClient.Endpoint, blockClient.ResourceBase)
+	} else {
+		log.Infof("Block storage endpoint discovered: %s", blockClient.Endpoint)
 	}
 
 	computeClient, err := openstack.NewComputeV2(provider, endpointOpts)
 	if err != nil {
-		return nil, err
+		log.Errorf("Failed to discover compute endpoint: %v", err)
+		return nil, fmt.Errorf("failed to create compute client: %v", err)
 	}
+	log.Infof("Compute endpoint discovered: %s", computeClient.Endpoint)
 
 	if config.MachineID == "" {
-		bytes, err := os.ReadFile("/etc/machine-id")
-		if err != nil {
-			return nil, err
+		// Try to get instance UUID from OpenStack metadata first (most reliable)
+		machineID, err := getInstanceIDFromMetadata()
+		if err == nil && machineID != "" {
+			config.MachineID = machineID
+			log.Infof("Using instance ID from OpenStack metadata: %s", machineID)
+		} else {
+			// Fallback to /etc/machine-id
+			log.Warnf("Could not get instance ID from metadata: %v, falling back to /etc/machine-id", err)
+			bytes, err := os.ReadFile("/etc/machine-id")
+			if err != nil {
+				return nil, err
+			}
+
+			machineIDStr := strings.TrimSpace(string(bytes))
+
+			// /etc/machine-id might be in format without dashes (32 hex chars)
+			// OpenStack expects UUID format with dashes
+			if len(machineIDStr) == 32 && !strings.Contains(machineIDStr, "-") {
+				// Convert to UUID format: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+				machineIDStr = fmt.Sprintf("%s-%s-%s-%s-%s",
+					machineIDStr[0:8],
+					machineIDStr[8:12],
+					machineIDStr[12:16],
+					machineIDStr[16:20],
+					machineIDStr[20:32])
+				log.Infof("Converted machine-id to UUID format: %s", machineIDStr)
+			}
+
+			// Validate it's a proper UUID
+			id, err := uuid.FromString(machineIDStr)
+			if err != nil {
+				return nil, fmt.Errorf("invalid machine-id format: %v", err)
+			}
+			config.MachineID = id.String()
+			log.Infof("Using machine-id: %s", config.MachineID)
 		}
-		id, err := uuid.FromString(strings.TrimSpace(string(bytes)))
-		if err != nil {
-			return nil, err
-		}
-		config.MachineID = id.String()
 	}
+
+	log.Infof("Plugin initialized with MachineID: %s", config.MachineID)
 
 	return &plugin{
 		blockClient:   blockClient,
@@ -83,10 +150,22 @@ func (d plugin) Create(r *volume.CreateRequest) error {
 		}
 	}
 
+	// Parse keyLock argument from docker-compose
+	keyLock := "false"
+	if ad, ok := r.Options["key_lock"]; ok {
+		keyLock = ad
+	}
+
+	metadata := map[string]string{
+		"key_lock": keyLock,
+		"docker_volume": "true",
+	}
+
 	// Create volume only (do not attach yet)
 	_, err := volumes.Create(ctx, d.blockClient, volumes.CreateOpts{
 		Size: size,
 		Name: r.Name,
+		Metadata: metadata,
 	}, volumes.SchedulerHintOpts{}).Extract()
 	if err != nil {
 		return fmt.Errorf("Volume create failed: %v", err)
@@ -151,7 +230,7 @@ func (d plugin) List() (*volume.ListResponse, error) {
 
 func (d plugin) Mount(r *volume.MountRequest) (*volume.MountResponse, error) {
     logger := log.WithFields(log.Fields{"name": r.Name, "action": "mount"})
-    logger.Infof("Mounting volume '%s'", r.Name)
+    logger.Infof("Mounting volume '%s' (our machine-id: %s)", r.Name, d.config.MachineID)
 
     d.mutex.Lock()
     defer d.mutex.Unlock()
@@ -160,6 +239,8 @@ func (d plugin) Mount(r *volume.MountRequest) (*volume.MountResponse, error) {
     if err != nil {
         return nil, fmt.Errorf("Volume not found: %v", err)
     }
+
+    logger.Infof("Volume found: ID=%s, Status=%s, Attachments=%d", vol.ID, vol.Status, len(vol.Attachments))
 
     mountPath := filepath.Join(d.config.MountDir, r.Name)
 
@@ -181,17 +262,88 @@ func (d plugin) Mount(r *volume.MountRequest) (*volume.MountResponse, error) {
     var devicePath string
 
     if len(vol.Attachments) > 0 {
-        for _, attachment := range vol.Attachments {
+        logger.Infof("Volume has %d attachment(s)", len(vol.Attachments))
+        for i, attachment := range vol.Attachments {
+            logger.Infof("Attachment %d: server_id=%s, device=%s, attachment_id=%s",
+                i, attachment.ServerID, attachment.Device, attachment.ID)
+
             if attachment.ServerID == d.config.MachineID {
                 attachedToThisInstance = true
                 devicePath = attachment.Device
-                logger.Infof("Volume %s already attached to this instance as %s", vol.ID, devicePath)
+                logger.Infof("✓ Volume %s already attached to THIS instance as %s", vol.ID, devicePath)
                 break
             } else {
-                logger.Warnf("Volume %s is attached to different instance: %s", vol.ID, attachment.ServerID)
-                return nil, fmt.Errorf("volume is attached to different instance")
+                // Volume is attached to a different instance (or same VM with different machine-id after reboot)
+                logger.Warnf("✗ Volume %s is attached to DIFFERENT server: %s (our ID: %s)",
+                    vol.ID, attachment.ServerID, d.config.MachineID)
+
+                // Check instance state before attempting detach
+                // If instance is rebooting, wait for it to complete
+                logger.Infof("→ Checking server %s state before detach...", attachment.ServerID)
+                serverState, err := d.getServerState(context.TODO(), attachment.ServerID)
+                if err != nil {
+                    logger.Warnf("Could not get server state: %v, attempting detach anyway", err)
+                } else {
+                    logger.Infof("Server state: %s, task_state: %s", serverState.Status, serverState.TaskState)
+
+                    // If server is rebooting, wait for it to complete
+                    if serverState.TaskState == "reboot_started" || serverState.TaskState == "rebooting" {
+                        logger.Infof("→ Server is rebooting, waiting up to 60s for completion...")
+                        for i := 0; i < 60; i++ {
+                            time.Sleep(1 * time.Second)
+                            serverState, err = d.getServerState(context.TODO(), attachment.ServerID)
+                            if err != nil {
+                                break
+                            }
+                            if serverState.TaskState == "" || serverState.TaskState == "none" {
+                                logger.Infof("✓ Server reboot completed (state: %s)", serverState.Status)
+                                break
+                            }
+                            if i%10 == 0 {
+                                logger.Infof("Still waiting... (task_state: %s)", serverState.TaskState)
+                            }
+                        }
+
+                        // Check if reboot completed
+                        if serverState.TaskState == "reboot_started" || serverState.TaskState == "rebooting" {
+                            logger.Warnf("Server still rebooting after 60s, will try detach anyway")
+                        }
+                    }
+                }
+
+                // Force detach from other instance
+                logger.Infof("→ Attempting force detach from server %s", attachment.ServerID)
+                ctx := context.TODO()
+                if err := volumeattach.Delete(ctx, d.computeClient, attachment.ServerID, attachment.ID).ExtractErr(); err != nil {
+                    logger.Errorf("✗ Detach failed: %v", err)
+
+                    // If detach failed due to instance state, wait and retry
+                    if strings.Contains(err.Error(), "task_state") {
+                        logger.Infof("→ Detach failed due to instance state, waiting 10s and retrying...")
+                        time.Sleep(10 * time.Second)
+                        if err := volumeattach.Delete(ctx, d.computeClient, attachment.ServerID, attachment.ID).ExtractErr(); err != nil {
+                            return nil, fmt.Errorf("failed to detach volume from server %s after retry: %v", attachment.ServerID, err)
+                        }
+                        logger.Infof("✓ Detach succeeded on retry")
+                    } else {
+                        return nil, fmt.Errorf("failed to detach volume from server %s: %v", attachment.ServerID, err)
+                    }
+                }
+                logger.Infof("✓ Detached successfully")
+
+                logger.Infof("→ Waiting for volume to reach 'available' state...")
+                vol, err = d.waitOnVolumeState(ctx, vol, "available")
+                if err != nil {
+                    logger.Errorf("✗ Timeout waiting for available state: %v", err)
+                    return nil, fmt.Errorf("timeout waiting for volume to become available: %v", err)
+                }
+                logger.Infof("✓ Volume is now available")
+                // After detach, vol.Attachments should be empty, so attachedToThisInstance stays false
+                break
             }
         }
+    } else {
+        logger.Infof("Volume has no attachments (available)")
     }
 
     // Attach only if not attached to this instance
@@ -218,28 +370,76 @@ func (d plugin) Mount(r *volume.MountRequest) (*volume.MountResponse, error) {
             logger.Errorf("Failed to find device. Before: %v, After: %v", existing, current)
             return nil, fmt.Errorf("block device not found for volume %s: %v", vol.ID, err)
         }
-    } else if devicePath == "" {
-        logger.Infof("Finding existing device...")
-        devicePath, err = findDeviceWithTimeout(existing)
+    } else {
+        // Volume already attached - need to find which device it is
+        logger.Infof("Volume already attached to this instance")
+
+        // ALWAYS search by volume ID (don't trust OpenStack device path)
+        // OpenStack may report /dev/vdb but kernel creates /dev/vde
+        logger.Infof("Searching for device by volume ID (ignoring OpenStack device path)...")
+        devicePath, err = findDeviceByVolumeID(vol.ID)
         if err != nil {
-            return nil, fmt.Errorf("block device not found for attached volume %s: %v", vol.ID, err)
+            logger.Errorf("Failed to find device by volume ID: %v", err)
+
+            // Wait a bit and retry (device might not be ready yet)
+            logger.Infof("Waiting for device to appear...")
+            time.Sleep(2 * time.Second)
+            devicePath, err = findDeviceByVolumeID(vol.ID)
+            if err != nil {
+                return nil, fmt.Errorf("cannot find device for attached volume %s: %v", vol.ID, err)
+            }
+        }
+        logger.Infof("Found device by volume ID: %s", devicePath)
+
+        // Double-check that device is not already mounted elsewhere
+        mounted, mountpoint, _ := isDeviceMounted(devicePath)
+        if mounted {
+            logger.Warnf("Device %s is already mounted at %s!", devicePath, mountpoint)
+            // If it's mounted to the correct path, just return success
+            if mountpoint == mountPath {
+                logger.Infof("Device is already mounted at correct location")
+                return &volume.MountResponse{Mountpoint: mountPath}, nil
+            }
+            // If mounted elsewhere, this is an error
+            return nil, fmt.Errorf("device %s is already mounted at %s (expected %s)",
+                devicePath, mountpoint, mountPath)
         }
     }
 
     logger.Infof("Using device: %s", devicePath)
 
+    // Wait a bit for device to be fully ready after attach
+    time.Sleep(2 * time.Second)
+
+    // Check filesystem type
     fsType, err := getFilesystemType(devicePath)
     if err != nil {
-        return nil, fmt.Errorf("detecting filesystem failed: %v", err)
+        logger.Warnf("Error detecting filesystem (device may not be ready): %v", err)
+        // Try waiting a bit more
+        time.Sleep(3 * time.Second)
+        fsType, err = getFilesystemType(devicePath)
+        if err != nil {
+            return nil, fmt.Errorf("detecting filesystem failed after retry: %v", err)
+        }
     }
 
     if fsType == "" {
-        logger.Infof("Formatting device %s as ext4", devicePath)
+        logger.Infof("No filesystem detected, formatting device %s as ext4", devicePath)
+
+        // Double-check the device is not mounted anywhere before formatting
+        out, _ := exec.Command("lsblk", "-no", "MOUNTPOINT", devicePath).CombinedOutput()
+        mountpoint := strings.TrimSpace(string(out))
+        if mountpoint != "" {
+            logger.Warnf("Device appears to be mounted at: %s", mountpoint)
+            return nil, fmt.Errorf("device %s is already mounted at %s", devicePath, mountpoint)
+        }
+
         if err := formatFilesystem(devicePath, r.Name, "ext4"); err != nil {
             return nil, fmt.Errorf("formatting failed: %v", err)
         }
+        logger.Infof("Device %s formatted successfully", devicePath)
     } else {
-        logger.Infof("Device %s already has filesystem: %s", devicePath, fsType)
+        logger.Infof("Device %s already has filesystem: %s (skipping format)", devicePath, fsType)
     }
 
     if err = os.MkdirAll(mountPath, 0755); err != nil {
@@ -290,21 +490,6 @@ func isMounted(path string) (bool, error) {
         return false, err
     }
     return true, nil
-}
-
-func findNewDevice(existing []string) (string, error) {
-	for i := 0; i < 20; i++ {
-		time.Sleep(500 * time.Millisecond)
-		devices, _ := filepath.Glob("/dev/vd*")
-
-		for _, d := range devices {
-			if !contains(existing, d) && !strings.HasSuffix(d, "1") &&
-				!strings.HasSuffix(d, "2") && !strings.HasSuffix(d, "3") && !strings.HasSuffix(d, "4") {
-				return d, nil
-			}
-		}
-	}
-	return "", errors.New("block device not found")
 }
 
 func (d plugin) Path(r *volume.PathRequest) (*volume.PathResponse, error) {
@@ -492,4 +677,52 @@ func (d plugin) waitOnVolumeState(ctx context.Context, vol *volumes.Volume, stat
             }
         }
     }
+}
+
+// ServerState represents the state of a compute instance
+type ServerState struct {
+    Status    string
+    TaskState string
+}
+
+// getServerState retrieves the current state of a compute instance
+func (d plugin) getServerState(ctx context.Context, serverID string) (*ServerState, error) {
+    type serverResponse struct {
+        Server struct {
+            Status    string `json:"status"`
+            TaskState string `json:"OS-EXT-STS:task_state"`
+        } `json:"server"`
+    }
+
+    url := fmt.Sprintf("%s/servers/%s", d.computeClient.ResourceBase, serverID)
+
+    req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+    if err != nil {
+        return nil, err
+    }
+
+    req.Header.Set("X-Auth-Token", d.computeClient.Token())
+    req.Header.Set("Accept", "application/json")
+
+    client := &http.Client{Timeout: 5 * time.Second}
+    resp, err := client.Do(req)
+    if err != nil {
+        return nil, err
+    }
+    defer resp.Body.Close()
+
+    if resp.StatusCode != 200 {
+        body, _ := io.ReadAll(resp.Body)
+        return nil, fmt.Errorf("unexpected status %d: %s", resp.StatusCode, string(body))
+    }
+
+    var data serverResponse
+    if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+        return nil, err
+    }
+
+    return &ServerState{
+        Status:    data.Server.Status,
+        TaskState: data.Server.TaskState,
+    }, nil
 }
