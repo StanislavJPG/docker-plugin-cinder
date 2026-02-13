@@ -135,6 +135,12 @@ func (d plugin) Capabilities() *volume.CapabilitiesResponse {
 }
 
 func (d plugin) Create(r *volume.CreateRequest) error {
+	existing, err := d.getByName(r.Name)
+    if err == nil && existing != nil {
+        log.Infof("Volume '%s' already exists (ID: %s), skipping create", r.Name, existing.ID)
+        return nil
+    }
+
 	logger := log.WithFields(log.Fields{"name": r.Name, "action": "create"})
 	logger.Infof("Creating volume '%s' ...", r.Name)
 
@@ -162,7 +168,7 @@ func (d plugin) Create(r *volume.CreateRequest) error {
 	}
 
 	// Create volume only (do not attach yet)
-	_, err := volumes.Create(ctx, d.blockClient, volumes.CreateOpts{
+	_, err = volumes.Create(ctx, d.blockClient, volumes.CreateOpts{
 		Size: size,
 		Name: r.Name,
 		Metadata: metadata,
@@ -229,6 +235,13 @@ func (d plugin) List() (*volume.ListResponse, error) {
 }
 
 func (d plugin) Mount(r *volume.MountRequest) (*volume.MountResponse, error) {
+	freshID, err := getInstanceIDFromMetadata()
+    if err == nil && freshID != "" && freshID != d.config.MachineID {
+        log.Warnf("MachineID mismatch! config=%s metadata=%s, updating...",
+            d.config.MachineID, freshID)
+        d.config.MachineID = freshID
+    }
+
     logger := log.WithFields(log.Fields{"name": r.Name, "action": "mount"})
     logger.Infof("Mounting volume '%s' (our machine-id: %s)", r.Name, d.config.MachineID)
 
